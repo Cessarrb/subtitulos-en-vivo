@@ -11,8 +11,8 @@ android {
         applicationId = "com.cessarrb.subtitulos"
         minSdk = 29
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2"
+        versionCode = 3
+        versionName = "0.3"
     }
 
     // Llave fija para que cada APK nuevo se instale encima del anterior
@@ -40,4 +40,6 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     // Traducción en el celular (gratis, offline)
     implementation("com.google.mlkit:translate:17.0.3")
+    // Detecta en qué idioma está el texto
+    implementation("com.google.mlkit:language-id:17.0.6")
 }
