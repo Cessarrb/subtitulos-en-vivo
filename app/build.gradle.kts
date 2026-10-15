@@ -9,10 +9,10 @@ android {
 
     defaultConfig {
         applicationId = "com.cessarrb.subtitulos"
-        minSdk = 29          // Android 10: lo mínimo para capturar el audio interno
+        minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2"
     }
 
     // Llave fija para que cada APK nuevo se instale encima del anterior
@@ -38,9 +38,6 @@ android {
 
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
-    // Reconocimiento de voz en el celular
-    implementation("com.alphacephei:vosk-android:0.3.47@aar")
-    implementation("net.java.dev.jna:jna:5.13.0@aar")
     // Traducción en el celular (gratis, offline)
     implementation("com.google.mlkit:translate:17.0.3")
 }

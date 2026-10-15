@@ -1,21 +1,25 @@
 # Subtítulos en vivo
 
-App Android que escucha lo que suena en el celular (reels, videos), lo transcribe en inglés y lo traduce al español en una ventanita flotante. Funciona sin internet después de la primera vez.
+App Android que lee los **Subtítulos instantáneos** de Android (Live Caption) y muestra la traducción al español en una ventanita flotante.
 
 ## Cómo funciona
 
-1. **Audio**: captura el audio interno con `AudioPlaybackCapture` (Android 10+), o el micrófono si lo elegís.
-2. **Voz → texto**: [Vosk](https://alphacephei.com/vosk/) con el modelo chico en inglés, corriendo en el celular.
-3. **Traducción**: ML Kit Translate de Google (gratis, offline).
-4. **Ventanita**: se dibuja encima de cualquier app. Arrastrala para moverla; doble toque muestra u oculta el inglés.
+1. Android transcribe el audio con sus Subtítulos instantáneos (en inglés).
+2. Un **servicio de accesibilidad** lee el texto de ese cuadro.
+3. **ML Kit Translate** de Google lo traduce al español (gratis, offline después de la primera vez).
+4. La traducción aparece en una ventanita azul que se puede arrastrar.
+
+La versión anterior, que transcribía el audio por su cuenta con Vosk, está en la rama `version-vosk`.
 
 ## Instalar
 
-Cada vez que se sube un cambio a `main`, GitHub compila el APK y lo publica en **Releases → Última versión**. Bajá `SubtitulosEnVivo.apk` desde el celular y abrilo (hay que permitir instalar apps de origen desconocido).
+- **GitHub Actions**: cada cambio en `main` compila el APK y lo publica en **Releases → Última versión**.
+- **Android Studio**: abrí la carpeta del proyecto y usá **Build → Build APK(s)**.
+
+Al ser una app instalada a mano, en Android 13 o superior puede que haya que ir a *Info de la app → ⋮ → Permitir configuración restringida* antes de poder activar el servicio de accesibilidad.
 
 ## Archivos
 
-- `MainActivity.kt`: pantalla principal y permisos.
-- `CaptionService.kt`: captura de audio, reconocimiento y traducción.
+- `MainActivity.kt`: instrucciones y diagnóstico.
+- `CaptionReaderService.kt`: lee los subtítulos y los traduce.
 - `CaptionOverlay.kt`: la ventanita flotante.
-- `ModelAssets.kt`: copia el modelo de voz del APK a la memoria de la app.
