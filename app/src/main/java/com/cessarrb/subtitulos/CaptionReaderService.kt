@@ -1,9 +1,13 @@
 package com.cessarrb.subtitulos
 
 import android.accessibilityservice.AccessibilityService
+import android.graphics.Color
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.google.mlkit.common.model.DownloadConditions
@@ -18,6 +22,11 @@ import java.util.Locale
  * Servicio de accesibilidad:
  *   lee el cuadro de "Subtítulos instantáneos" de Android
  *   → detecta el idioma → traduce al español con ML Kit → ventanita.
+ *
+ * Para que el texto no "baile":
+ *   - Las frases terminadas se traducen UNA vez y quedan fijas.
+ *   - Solo la frase que se está diciendo se va actualizando (en gris, al final).
+ *   - Si alguien habla sin punto final mucho rato, se van fijando trozos igual.
  */
 class CaptionReaderService : AccessibilityService() {
 
@@ -25,19 +34,28 @@ class CaptionReaderService : AccessibilityService() {
     private lateinit var overlay: CaptionOverlay
     private val languageId = LanguageIdentification.getClient()
 
-    // Un traductor por idioma de origen (inglés→español, ruso→español, ...)
+    // ---- Traductores: uno por idioma de origen ----
     private val translators = mutableMapOf<String, Translator>()
     private val readyLangs = mutableSetOf<String>()
     private val downloadingLangs = mutableSetOf<String>()
     private var currentLang = TranslateLanguage.ENGLISH
 
+    // ---- Lo que se muestra ----
+    private class Entry(var es: String? = null)
+    private val entries = ArrayList<Entry>()            // frases fijas, ya traducidas
+    private val recentSources = ArrayDeque<String>()    // originales ya fijados (para no repetir)
+    private var forcedWords = 0                          // palabras de la frase actual ya fijadas
+    private var liveSource = ""                          // frase que se está diciendo
+    private var livePreview = ""                         // su traducción provisoria
+    private var liveInFlight = false
+    private var livePending = false
+
+    // ---- Lectura de pantalla ----
     private var scanScheduled = false
     private var lastText = ""
-    private var pendingText: String? = null
-    private var translating = false
     private var lastDiagAt = 0L
 
-    private val hideRunnable = Runnable { overlay.hide(); lastText = "" }
+    private val hideRunnable = Runnable { overlay.hide(); resetTranscript() }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -47,13 +65,15 @@ class CaptionReaderService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        // Llegan muchísimos avisos; revisamos la pantalla como mucho cada 200 ms
         if (scanScheduled) return
         scanScheduled = true
         main.postDelayed({ scanScheduled = false; scan() }, SCAN_EVERY_MS)
     }
 
-    /** Busca la ventana de Subtítulos instantáneos y lee su texto. */
+    // =====================================================================
+    // 1) Leer el cuadro de Subtítulos instantáneos
+    // =====================================================================
+
     private fun scan() {
         val now = SystemClock.uptimeMillis()
         val writeDiag = now - lastDiagAt > 1000
@@ -67,7 +87,7 @@ class CaptionReaderService : AccessibilityService() {
             val title = w.title?.toString() ?: ""
             val isCaption = pkg in CAPTION_PACKAGES || CAPTION_TITLE.containsMatchIn(title)
 
-            if (isCaption) captionText = collectText(root).trim()
+            if (isCaption) captionText = collectText(root)
             if (writeDiag) {
                 diag.append(if (isCaption) "★ " else "• ")
                     .append(title.ifEmpty { "(sin título)" }).append(" — ").append(pkg)
@@ -82,60 +102,151 @@ class CaptionReaderService : AccessibilityService() {
         }
 
         if (captionText == null) {
-            // No hay cuadro de subtítulos: escondemos la traducción en un ratito
             main.removeCallbacks(hideRunnable)
             main.postDelayed(hideRunnable, HIDE_AFTER_MS)
             return
         }
         main.removeCallbacks(hideRunnable)
 
-        val text = tail(captionText)
+        val text = captionText.replace(Regex("\\s+"), " ").trim()
         if (text.isEmpty() || text == lastText) return
         lastText = text
         lastCaption = text
-        pendingText = text
-        translateNext()
+        process(text)
     }
 
-    /** Toma el texto más nuevo, detecta el idioma y lo traduce. */
-    private fun translateNext() {
-        if (translating) return
-        val t = pendingText ?: return
-        pendingText = null
-        translating = true
+    // =====================================================================
+    // 2) Separar lo terminado (fijo) de lo que se está diciendo (provisorio)
+    // =====================================================================
 
-        languageId.identifyLanguage(t)
+    private fun process(text: String) {
+        val sentences = text.split(SENTENCE_END).map { it.trim() }.filter { it.isNotEmpty() }
+        if (sentences.isEmpty()) return
+
+        // Todas menos la última ya terminaron: se fijan (si no estaban)
+        sentences.dropLast(1).forEach { commitSentence(it) }
+
+        // La última es la que se está diciendo
+        val liveWords = sentences.last().split(' ')
+        if (liveWords.size < forcedWords) forcedWords = 0 // empezó otra frase
+        var pending = liveWords.drop(forcedWords)
+
+        // Si habla mucho sin punto, fijamos un trozo y dejamos las últimas palabras abiertas
+        if (pending.size >= FORCE_AFTER_WORDS) {
+            val chunk = pending.dropLast(KEEP_OPEN_WORDS)
+            addEntry(chunk.joinToString(" "))
+            forcedWords += chunk.size
+            pending = pending.takeLast(KEEP_OPEN_WORDS)
+        }
+        updateLive(pending.joinToString(" "))
+    }
+
+    private fun commitSentence(sentence: String) {
+        val key = normalize(sentence)
+        if (key.isEmpty() || isKnown(key)) return
+        remember(key)
+
+        // Si ya habíamos fijado el principio de esta frase, agregamos solo el resto
+        val rest = sentence.split(' ').drop(forcedWords).joinToString(" ")
+        forcedWords = 0
+        if (rest.isNotBlank()) addEntry(rest)
+        if (liveSource.isNotEmpty() && normalize(sentence).contains(normalize(liveSource))) {
+            liveSource = ""; livePreview = ""
+        }
+    }
+
+    /** ¿Ya fijamos esta frase? (tolera que el cuadro la recorte o la corrija un poco) */
+    private fun isKnown(key: String): Boolean = recentSources.any { old ->
+        old == key || old.endsWith(key) || old.startsWith(key) || key.startsWith(old) || similar(old, key)
+    }
+
+    private fun similar(a: String, b: String): Boolean {
+        val wa = a.split(' ').toSet(); val wb = b.split(' ').toSet()
+        if (wa.isEmpty() || wb.isEmpty()) return false
+        return wa.intersect(wb).size.toFloat() / maxOf(wa.size, wb.size) >= 0.7f
+    }
+
+    private fun remember(key: String) {
+        recentSources.addLast(key)
+        while (recentSources.size > 40) recentSources.removeFirst()
+    }
+
+    private fun normalize(s: String) =
+        s.lowercase().replace(Regex("[^\\p{L}\\p{N} ]"), "").replace(Regex("\\s+"), " ").trim()
+
+    /** Agrega un trozo fijo; su traducción se completa cuando llega. */
+    private fun addEntry(source: String) {
+        val entry = Entry()
+        entries.add(entry)
+        while (entries.size > MAX_ENTRIES) entries.removeAt(0)
+        translate(source) { es -> entry.es = es ?: source; render() }
+    }
+
+    /** La frase en curso: se traduce de a una, siempre la versión más nueva. */
+    private fun updateLive(source: String) {
+        if (source == liveSource) return
+        if (!source.startsWith(liveSource.take(10))) livePreview = "" // es otra frase
+        liveSource = source
+        if (source.isEmpty()) { livePreview = ""; render(); return }
+        if (liveInFlight) { livePending = true; return }
+        liveInFlight = true
+        val asked = source
+        translate(asked) { es ->
+            if (es != null && liveSource.isNotEmpty()) livePreview = es
+            render()
+            liveInFlight = false
+            if (livePending) { livePending = false; val s = liveSource; liveSource = ""; updateLive(s) }
+        }
+    }
+
+    private fun resetTranscript() {
+        entries.clear(); recentSources.clear()
+        forcedWords = 0; liveSource = ""; livePreview = ""; lastText = ""
+    }
+
+    // =====================================================================
+    // 3) Mostrar: frases fijas en blanco + la provisoria en gris, todo seguido
+    // =====================================================================
+
+    private fun render() {
+        val sb = SpannableStringBuilder()
+        if (downloadingLangs.isNotEmpty()) {
+            sb.append("⏬ Bajando traductor de ${downloadingLangs.joinToString { langName(it) }}…\n")
+        }
+        entries.mapNotNull { it.es }.forEach { sb.append(it).append(' ') }
+        if (livePreview.isNotEmpty()) {
+            val start = sb.length
+            sb.append(livePreview)
+            sb.setSpan(ForegroundColorSpan(Color.argb(190, 200, 210, 230)),
+                start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        overlay.setContent(sb)
+    }
+
+    // =====================================================================
+    // 4) Traducir (detecta el idioma y baja el traductor si hace falta)
+    // =====================================================================
+
+    private fun translate(text: String, done: (String?) -> Unit) {
+        languageId.identifyLanguage(text)
             .addOnSuccessListener { tag ->
-                // Con textos muy cortos la detección falla; mantenemos el idioma anterior
-                if (tag != "und" && t.length >= MIN_CHARS_TO_DETECT) {
+                // Con textos cortos la detección falla: mantenemos el idioma anterior
+                if (tag != "und" && text.length >= MIN_CHARS_TO_DETECT) {
                     TranslateLanguage.fromLanguageTag(tag)?.let { currentLang = it }
-                        ?: run { status = "Idioma no soportado: ${langName(tag)}" }
                 }
-                translateWith(currentLang, t)
+                translateWith(currentLang, text, done)
             }
-            .addOnFailureListener { translateWith(currentLang, t) }
+            .addOnFailureListener { translateWith(currentLang, text, done) }
     }
 
-    private fun translateWith(lang: String, t: String) {
-        if (lang == TranslateLanguage.SPANISH) {   // ya está en español
-            overlay.setText(t); finish(); return
-        }
-        if (lang !in readyLangs) {
-            prepare(lang)
-            overlay.setText("Bajando el traductor de ${langName(lang)}… (solo la primera vez, ~30 MB)")
-            finish(); return
-        }
-        translators.getValue(lang).translate(t)
-            .addOnSuccessListener { es -> overlay.setText(es) }
-            .addOnCompleteListener { finish() }
+    private fun translateWith(lang: String, text: String, done: (String?) -> Unit) {
+        if (lang == TranslateLanguage.SPANISH) { done(text); return }
+        if (lang !in readyLangs) { prepare(lang); done(null); return }
+        translators.getValue(lang).translate(text)
+            .addOnSuccessListener { done(it) }
+            .addOnFailureListener { done(null) }
     }
 
-    private fun finish() {
-        translating = false
-        translateNext()
-    }
-
-    /** Crea el traductor de ese idioma y baja su modelo si hace falta. */
     private fun prepare(lang: String) {
         if (lang in readyLangs || lang in downloadingLangs) return
         downloadingLangs += lang
@@ -152,10 +263,9 @@ class CaptionReaderService : AccessibilityService() {
             .addOnSuccessListener {
                 readyLangs += lang
                 status = "Traductores listos: " + readyLangs.joinToString { langName(it) }
-                lastText = "" // fuerza a traducir de nuevo lo que hay en pantalla
             }
             .addOnFailureListener { status = "No se pudo bajar el traductor (¿sin internet?): ${it.message}" }
-            .addOnCompleteListener { downloadingLangs -= lang }
+            .addOnCompleteListener { downloadingLangs -= lang; resetTranscript() }
     }
 
     private fun langName(tag: String): String =
@@ -170,14 +280,6 @@ class CaptionReaderService : AccessibilityService() {
         }
         walk(node)
         return sb.toString()
-    }
-
-    /** Nos quedamos con el final del texto (lo más reciente), cortando en una palabra. */
-    private fun tail(s: String): String {
-        val clean = s.replace(Regex("\\s+"), " ").trim()
-        if (clean.length <= MAX_CHARS) return clean
-        val cut = clean.substring(clean.length - MAX_CHARS)
-        return cut.substringAfter(' ', cut)
     }
 
     override fun onInterrupt() {}
@@ -201,10 +303,13 @@ class CaptionReaderService : AccessibilityService() {
         // App del sistema que dibuja los Subtítulos instantáneos en la mayoría de los celulares
         private val CAPTION_PACKAGES = setOf("com.google.android.as")
         private val CAPTION_TITLE = Regex("(?i)live ?caption|subt[ií]tulos? instant")
+        private val SENTENCE_END = Regex("(?<=[.!?…。？！])\\s+")
 
-        private const val SCAN_EVERY_MS = 200L
-        private const val HIDE_AFTER_MS = 1500L
-        private const val MAX_CHARS = 220
+        private const val SCAN_EVERY_MS = 100L
+        private const val HIDE_AFTER_MS = 4000L
         private const val MIN_CHARS_TO_DETECT = 20
+        private const val MAX_ENTRIES = 30
+        private const val FORCE_AFTER_WORDS = 16  // frase sin punto: fijar cada tanto
+        private const val KEEP_OPEN_WORDS = 5     // últimas palabras que quedan provisorias
     }
 }
